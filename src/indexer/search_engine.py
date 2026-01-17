@@ -261,6 +261,148 @@ class SearchEngine:
         except Exception as e:
             logger.error(f"更新索引失败 {file_path}: {e}")
 
+    def sync_directory(
+        self,
+        directory: str,
+        progress_callback: Optional[Callable[[int, int, str], None]] = None
+    ) -> Dict[str, int]:
+        """
+        增量同步目录 - 检测并索引新增/修改的文件，删除已删除的文件
+
+        适用场景：程序停用一段时间后重新启动，自动检测文件变化
+
+        Args:
+            directory: 要同步的目录路径
+            progress_callback: 进度回调函数 (当前数, 总数, 描述)
+
+        Returns:
+            同步统计信息
+        """
+        stats = {
+            'scanned': 0,
+            'added': 0,
+            'updated': 0,
+            'deleted': 0,
+            'unchanged': 0,
+            'errors': 0
+        }
+
+        logger.info(f"开始同步目录: {directory}")
+
+        # 1. 获取索引中的所有文件及修改时间
+        indexed_files = {}  # {path: modified_time}
+        try:
+            with self.ix.searcher() as searcher:
+                for doc in searcher.all_stored_fields():
+                    path = doc.get('path')
+                    modified = doc.get('modified')
+                    if path and modified:
+                        indexed_files[path] = modified
+
+            logger.info(f"索引中有 {len(indexed_files)} 个文件")
+        except Exception as e:
+            logger.error(f"读取索引失败: {e}")
+            return stats
+
+        # 2. 扫描文件系统中的所有文件
+        filesystem_files = {}  # {path: modified_time}
+        for root, _, filenames in os.walk(directory):
+            for filename in filenames:
+                file_path = os.path.join(root, filename)
+                try:
+                    stat = os.stat(file_path)
+                    modified = datetime.fromtimestamp(stat.st_mtime)
+                    filesystem_files[file_path] = modified
+                except Exception as e:
+                    logger.error(f"读取文件信息失败 {file_path}: {e}")
+
+        stats['scanned'] = len(filesystem_files)
+        logger.info(f"文件系统中有 {len(filesystem_files)} 个文件")
+
+        # 3. 找出需要处理的文件
+        to_add = []      # 新增的文件
+        to_update = []   # 修改的文件
+        to_delete = []   # 删除的文件
+
+        # 检查新增和修改的文件
+        for file_path, fs_modified in filesystem_files.items():
+            if file_path not in indexed_files:
+                # 新文件
+                to_add.append(file_path)
+            else:
+                # 检查是否修改（时间戳比较）
+                idx_modified = indexed_files[file_path]
+                # 允许 1 秒的误差（避免浮点数精度问题）
+                if abs((fs_modified - idx_modified).total_seconds()) > 1:
+                    to_update.append(file_path)
+                else:
+                    stats['unchanged'] += 1
+
+        # 检查删除的文件
+        for file_path in indexed_files:
+            if file_path not in filesystem_files:
+                to_delete.append(file_path)
+
+        total_changes = len(to_add) + len(to_update) + len(to_delete)
+        logger.info(f"发现变化: 新增 {len(to_add)}, 修改 {len(to_update)}, 删除 {len(to_delete)}")
+
+        if total_changes == 0:
+            logger.info("没有文件变化，跳过同步")
+            return stats
+
+        # 4. 执行同步操作
+        writer = AsyncWriter(self.ix)
+        current = 0
+
+        try:
+            # 处理新增文件
+            for file_path in to_add:
+                current += 1
+                if progress_callback:
+                    progress_callback(current, total_changes, f"新增: {Path(file_path).name}")
+
+                try:
+                    if self._index_file(writer, file_path):
+                        stats['added'] += 1
+                except Exception as e:
+                    logger.error(f"添加文件失败 {file_path}: {e}")
+                    stats['errors'] += 1
+
+            # 处理修改文件
+            for file_path in to_update:
+                current += 1
+                if progress_callback:
+                    progress_callback(current, total_changes, f"更新: {Path(file_path).name}")
+
+                try:
+                    if self._index_file(writer, file_path):
+                        stats['updated'] += 1
+                except Exception as e:
+                    logger.error(f"更新文件失败 {file_path}: {e}")
+                    stats['errors'] += 1
+
+            # 处理删除文件
+            for file_path in to_delete:
+                current += 1
+                if progress_callback:
+                    progress_callback(current, total_changes, f"删除: {Path(file_path).name}")
+
+                try:
+                    writer.delete_by_term('path', file_path)
+                    stats['deleted'] += 1
+                except Exception as e:
+                    logger.error(f"删除文件失败 {file_path}: {e}")
+                    stats['errors'] += 1
+
+            writer.commit()
+            logger.info(f"同步完成: {stats}")
+
+        except Exception as e:
+            logger.error(f"同步过程出错: {e}")
+            writer.cancel()
+
+        return stats
+
     def clear_index(self):
         """清空所有索引"""
         try:

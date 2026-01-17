@@ -41,6 +41,9 @@ class MainWindow(ctk.CTk):
         # 加载统计信息
         self._update_stats()
 
+        # 检查是否需要同步（延迟执行，等待窗口显示）
+        self.after(500, self._check_sync_on_startup)
+
     def _create_ui(self):
         """创建用户界面"""
 
@@ -74,6 +77,16 @@ class MainWindow(ctk.CTk):
             width=120
         )
         select_dir_btn.pack(side="right", padx=10, pady=10)
+
+        sync_btn = ctk.CTkButton(
+            dir_frame,
+            text="🔄 智能同步",
+            command=self._smart_sync,
+            width=120,
+            fg_color="orange",
+            hover_color="darkorange"
+        )
+        sync_btn.pack(side="right", padx=5, pady=10)
 
         index_btn = ctk.CTkButton(
             dir_frame,
@@ -264,6 +277,70 @@ class MainWindow(ctk.CTk):
             messagebox.showerror("错误", f"索引失败: {e}")
             self.progress_label.configure(text="索引失败")
 
+    def _smart_sync(self):
+        """智能同步 - 检测文件变化并增量更新索引"""
+        if not self.current_directory:
+            messagebox.showwarning("警告", "请先选择要索引的目录")
+            return
+
+        if self.indexing_thread and self.indexing_thread.is_alive():
+            messagebox.showinfo("提示", "索引正在进行中...")
+            return
+
+        # 在后台线程执行同步
+        self.indexing_thread = threading.Thread(target=self._sync_worker, daemon=True)
+        self.indexing_thread.start()
+
+    def _sync_worker(self):
+        """同步工作线程"""
+        try:
+            self.progress_bar.set(0)
+            self.progress_label.configure(text="检测文件变化...")
+
+            def progress_callback(current, total, description):
+                """进度回调"""
+                progress = current / total if total > 0 else 0
+                self.progress_bar.set(progress)
+                self.progress_label.configure(text=f"同步中: {current}/{total} - {description}")
+
+            # 执行同步
+            stats = self.search_engine.sync_directory(
+                self.current_directory,
+                progress_callback
+            )
+
+            # 更新统计
+            self._update_stats()
+
+            # 完成
+            self.progress_bar.set(1.0)
+
+            # 显示结果
+            if stats['added'] == 0 and stats['updated'] == 0 and stats['deleted'] == 0:
+                self.progress_label.configure(text="没有文件变化")
+                self.status_label.configure(text="索引已是最新")
+                messagebox.showinfo("同步完成", "没有检测到文件变化，索引已是最新！")
+            else:
+                self.progress_label.configure(
+                    text=f"同步完成! 新增: {stats['added']}, 更新: {stats['updated']}, 删除: {stats['deleted']}"
+                )
+                self.status_label.configure(text=f"同步完成: 处理了 {stats['added'] + stats['updated'] + stats['deleted']} 个变化")
+
+                messagebox.showinfo(
+                    "同步完成",
+                    f"✅ 扫描文件: {stats['scanned']} 个\n"
+                    f"📄 新增: {stats['added']} 个\n"
+                    f"🔄 更新: {stats['updated']} 个\n"
+                    f"🗑️ 删除: {stats['deleted']} 个\n"
+                    f"✔️ 未变化: {stats['unchanged']} 个\n"
+                    f"❌ 错误: {stats['errors']} 个"
+                )
+
+        except Exception as e:
+            logger.error(f"同步失败: {e}")
+            messagebox.showerror("错误", f"同步失败: {e}")
+            self.progress_label.configure(text="同步失败")
+
     def _perform_search(self):
         """执行搜索"""
         query = self.search_entry.get().strip()
@@ -378,6 +455,61 @@ class MainWindow(ctk.CTk):
             )
         except Exception as e:
             logger.error(f"更新统计信息失败: {e}")
+
+    def _check_sync_on_startup(self):
+        """启动时检查是否需要同步"""
+        try:
+            stats = self.search_engine.get_stats()
+            total_docs = stats.get('total_documents', 0)
+
+            # 如果已有索引，获取索引中的第一个文件路径作为参考
+            if total_docs > 0:
+                # 尝试从索引中获取一个目录路径
+                with self.search_engine.ix.searcher() as searcher:
+                    for doc in searcher.all_stored_fields():
+                        path = doc.get('path')
+                        if path and os.path.exists(path):
+                            # 提取目录路径
+                            directory = str(Path(path).parent)
+
+                            # 找到根目录（向上查找直到找到包含多个索引文件的目录）
+                            while directory and directory != os.path.dirname(directory):
+                                # 检查这个目录下有多少文件在索引中
+                                count = 0
+                                with self.search_engine.ix.searcher() as s2:
+                                    for d in s2.all_stored_fields():
+                                        if d.get('path', '').startswith(directory):
+                                            count += 1
+                                            if count > 5:  # 如果找到超过5个文件，认为这是根目录
+                                                break
+
+                                if count > 5:
+                                    break
+
+                                directory = os.path.dirname(directory)
+
+                            # 设置为当前目录
+                            self.current_directory = directory
+                            self.dir_label.configure(text=f"📂 {directory}")
+
+                            # 提示用户是否同步
+                            response = messagebox.askyesno(
+                                "检测到现有索引",
+                                f"发现已索引 {total_docs} 个文件。\n\n"
+                                f"目录: {directory}\n\n"
+                                "是否检查文件变化并同步索引？\n\n"
+                                "（推荐：如果文件有更新，选择"是"）",
+                                icon='question'
+                            )
+
+                            if response:
+                                # 用户选择同步
+                                self._smart_sync()
+
+                            break
+
+        except Exception as e:
+            logger.error(f"启动检查失败: {e}")
 
     @staticmethod
     def _format_size(size_bytes: int) -> str:
