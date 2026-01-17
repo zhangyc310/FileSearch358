@@ -1,0 +1,16 @@
+# UI Framework
+customtkinter==5.2.2
+
+# Search Engine
+whoosh==2.7.4
+
+# Document Parsers
+PyMuPDF==1.23.26  # PDF 提取
+python-docx==1.1.0  # DOCX 提取
+pywin32==306; sys_platform == 'win32'  # DOC 提取 (Windows)
+
+# File Monitoring
+watchdog==4.0.0
+
+# Utilities
+pillow==10.2.0  # 图标支持
